@@ -25,36 +25,56 @@ The project skeleton is **always [Order](https://order.atomichorizon.net/)** —
 
 ## Default project skeleton (Order-shaped)
 
-Always propose a layout aligned to Order's roots and Rojo's `default.project.json`:
+Always propose a layout aligned to Order's roots, Order's **code-group** convention, and Rojo's `default.project.json`. **The code group is a mandatory layer between each context and its `tasks/`/`lib/` folders** — see [Code groups](#code-groups) below for why. The default group is always `core`; add more (`game`, `lobby`, `arena`, `tutorial`, etc.) as the universe grows.
 
 ```
 project-root/
 ├── default.project.json
-├── wally.toml                 # runtime + [dev-dependencies]
-├── rokit.toml                 # tool versions (rojo, wally, selene, stylua, lune, ...)
+├── wally.toml                       # runtime + [dev-dependencies]
+├── rokit.toml                       # tool versions (rojo, wally, selene, stylua, lune, ...)
 ├── selene.toml
 ├── stylua.toml
-├── .github/workflows/         # CI: rokit install -> wally install -> selene -> stylua --check -> lune test
-├── tests/                     # jest-lua specs, mirror src/ paths
-├── tools/                     # lune scripts: codegen, build, packaging
+├── .github/workflows/               # CI: rokit install -> wally install -> selene -> stylua --check -> lune test
+├── tests/                           # jest-lua specs, mirror src/ paths
+├── tools/                           # lune scripts: codegen, build, packaging
 └── src/
-    ├── first/                 # ReplicatedFirst — splash/preload only, no Order tasks
-    ├── character/             # StarterCharacterScripts — no Order tasks
+    ├── framework/                   # Order itself (mounted at ReplicatedStorage.Order)
+    │   └── Settings.luau            # PlaceTypes + CodeGroups live here
+    ├── first/                       # ReplicatedFirst — splash/preload only, no Order tasks
+    ├── character/                   # StarterCharacterScripts — no Order tasks
     ├── shared/
-    │   ├── tasks/             # auto-loaded shared tasks
-    │   └── lib/               # pure modules: types, constants, math, table, string utils
+    │   └── core/                    # default code group (always loaded)
+    │       ├── tasks/               # auto-loaded shared tasks
+    │       ├── lib/                 # pure modules: types, constants, math, table, string utils
+    │       └── external/            # vendored third-party shared modules
     ├── client/
-    │   ├── tasks/             # client lifecycle: input, ui boot, camera
-    │   └── lib/               # client-only helpers (effects, sound, ui primitives)
+    │   └── core/
+    │       ├── tasks/               # client lifecycle: input, ui boot, camera
+    │       ├── lib/                 # client-only helpers (effects, sound, ui primitives)
+    │       └── external/
     ├── server/
-    │   ├── tasks/             # server lifecycle: data, economy, matchmaking, anti-cheat
-    │   └── lib/               # server-only helpers
-    └── Packages/              # wally output (committed via .gitignore'd lockfile flow your team prefers)
+    │   └── core/
+    │       ├── tasks/               # server lifecycle: data, economy, matchmaking, anti-cheat
+    │       ├── lib/                 # server-only helpers
+    │       └── external/
+    └── Packages/                    # wally output
         └── _Index/
+```
+
+Once a second place type appears, add a sibling group folder per context — never overload `core/`:
+
+```
+src/server/
+├── core/        # always loaded
+├── lobby/       # only loaded when Settings.PlaceTypes resolves to "Lobby"
+├── game/        # only loaded for game-server place types
+├── arena/       # only loaded when an Arena code-group is active
+└── tutorial/    # only loaded when a Tutorial code-group is active
 ```
 
 Mounts (memorise):
 
+- `framework/` -> `ReplicatedStorage.Order`
 - `first/` -> `ReplicatedFirst`
 - `character/` -> `StarterPlayer.StarterCharacterScripts`
 - `shared/` -> `ReplicatedStorage.Shared`
@@ -81,6 +101,47 @@ Internalised from [docs/intro](https://order.atomichorizon.net/docs/intro), [doc
 - `Priority` (number) tunes load order — **higher first, negatives last**. Same priority is non-deterministic. **Yields during init break ordering guarantees**, so don't yield in `:Prep()`.
 - Custom init pipelines: define `InitConfigOverride` on the task table, mirroring `InitFunctionConfig` in `Settings.luau`.
 
+### Code groups
+
+Code groups are how Order shards a project across place types. They are **mandatory structure**, not an optional flourish — every project has at least the `core` group, and the moment you add a second place type you add a sibling group rather than overloading `core`.
+
+**Layout rule.** Each context (`client/`, `server/`, `shared/`) contains one folder per code group. Inside each group, the conventional subfolders are `tasks/` (auto-loaded), `lib/` (lazy helpers), and `external/` (vendored third-party).
+
+**Activation.** Two tables in `Settings.luau` decide what loads on a given server:
+
+```luau
+PlaceTypes = {
+    [123456789] = "Lobby",
+    [234567890] = "Game",
+    [345678901] = "Tutorial",
+}
+
+CodeGroups = {
+    Generic  = { core = true },                                    -- fallback for unmapped places
+    Lobby    = { core = true, lobby = true },
+    Game     = { core = true, game = true, arena = true },
+    Tutorial = { core = true, game = true, arena = true, tutorial = true },
+}
+```
+
+At boot, Order resolves the current `game.PlaceId` through `PlaceTypes` to a type name (defaulting to `"Generic"`), looks that name up in `CodeGroups`, and only loads the listed group folders from each context. The active type is exposed at runtime as `shared.PlaceType`.
+
+**Type signature** (from upstream `Settings.luau`):
+
+```luau
+PlaceTypes: { [number]: string },
+CodeGroups: { [string]: { [string]: true } },
+```
+
+**Rules of thumb.**
+
+- **Always include `core`** in every place type's group set. `core` is shared infrastructure (data, networking primitives, util) that every server needs.
+- **Group names match folder names exactly** and are case-sensitive. `game = true` means the framework loads `src/client/game/`, `src/server/game/`, `src/shared/game/`.
+- **Cross-group access is fine.** A task in `game/` can `shared("CoreThing")` a module from `core/` — they're all in the same VM. The group system controls *what loads on which server*, not *what can call what*.
+- **Don't read `shared.PlaceType` to branch behaviour** within a single group. If a behaviour only applies to one place type, that code belongs in a group folder for that place type — Order will simply not load it elsewhere. Reserve `shared.PlaceType` for telemetry, logging, and the rare cross-cutting case (e.g. a shared analytics task that tags events with the place type).
+- **Add groups proactively, not reactively.** The cost of introducing the layer when the repo is small is one extra folder per context. The cost of introducing it later, after `core/` has accumulated tutorial-only code, lobby-only code, and game-only code, is a real refactor.
+- **Place ID -> name resolution is the only place place IDs appear.** Never hard-code `game.PlaceId == 123` anywhere in project code; let `Settings.PlaceTypes` own the mapping.
+
 ### Cyclic dependencies
 
 - Cyclic dependencies are **supported**. That's Order's headline feature.
@@ -94,7 +155,7 @@ Internalised from [docs/intro](https://order.atomichorizon.net/docs/intro), [doc
 - `SilentMode` — suppress regular output (defaults true in production, false in Studio). Warnings always print.
 - `InitOrder` — `"Project"` (run each initializer across every task before the next initializer) vs `"Individual"` (run all initializers on each task before moving on). Both still respect `Priority`.
 - `InitFunctionConfig` — table of init functions and their flags (name, async, protected, warn delay).
-- `PlaceTypes` + `CodeGroups` — map place IDs to type names, then map type names to active code-group roots. Lets one repo serve lobby + game-server + portal + etc. Read the active type at runtime via `shared.PlaceType`.
+- `PlaceTypes` + `CodeGroups` — see the dedicated [Code groups](#code-groups) section above. Don't recreate the mapping ad hoc.
 
 ### Naming & discovery
 
@@ -169,11 +230,13 @@ When reviewing an existing repo, look for and call out:
 
 - `require(script.Parent…)` chains -> migrate to `shared("Name")`.
 - Modules outside any `tasks/` folder running side effects at top level -> move into a task or make them lazy.
+- **Missing code-group layer** (`tasks/`/`lib/` sitting directly under `client/`/`server/`/`shared/` with no group folder in between) -> introduce `core/` immediately; it costs one folder per context and prevents a painful migration when a second place type appears.
+- **Multi-place repo with `game.PlaceId == X` runtime branching anywhere outside `Settings.PlaceTypes`** -> migrate the branch to a code group so the irrelevant code never loads on the wrong server.
+- **Code that only runs on one place type living in `core/`** -> move it to its own group and add the group to that place type's `CodeGroups` entry.
 - Bare top-level access to a cyclic dependency -> wrap in a function or restructure.
 - Cross-context leaks (`shared/` reaching into `server/`, `client/` requiring `server/`) -> invert the dependency or move the type.
 - **Knit / Flamework / Sapphire (or any other orchestration framework) present** -> migrate services to Order tasks with `:Prep()`/`:Init()`; cite the rejection section above.
 - **Custom `Loader`-style folder-walk utilities** -> delete; rely on `tasks/` auto-discovery.
-- **`game.PlaceId == X` runtime branching for multi-place setups** -> migrate to `Settings.PlaceTypes` + `CodeGroups` and read `shared.PlaceType`.
 - Hand-rolled DataStore wrappers for player data -> recommend ProfileStore migration with a one-shot Lune script for the schema move.
 - Hand-rolled remotes without validation -> recommend ByteNet/Red and reference the `roblox-opsec` skill for the validation layer.
 - Mixed tool versions or no `rokit.toml` -> consolidate.
