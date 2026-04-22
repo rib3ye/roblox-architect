@@ -142,6 +142,24 @@ CodeGroups: { [string]: { [string]: true } },
 - **Add groups proactively, not reactively.** The cost of introducing the layer when the repo is small is one extra folder per context. The cost of introducing it later, after `core/` has accumulated tutorial-only code, lobby-only code, and game-only code, is a real refactor.
 - **Place ID -> name resolution is the only place place IDs appear.** Never hard-code `game.PlaceId == 123` anywhere in project code; let `Settings.PlaceTypes` own the mapping.
 
+### Built-in player data (`PlayerData` + `DataController`)
+
+Order ships with two tasks that wrap **ProfileService + ReplicaService** for you. You do not require ProfileService directly. You do not require ReplicaService directly. You do not write a custom `ProfileLoader.luau`. You go through these.
+
+- **Server: `shared("PlayerData")`** — owns the profile and the replica. Use:
+  - `:GetValue(player, keyPath)` / `:SetValue(player, keyPath, value)` for scalars.
+  - `:IncrementNumValue(player, keyPath, delta)` for numeric counters (initialises to 0 if nil).
+  - `:Observe(player, keyPath, callback)` and `:SetValueCallback(keyPath, callback, runImmediately?)` for change listeners.
+  - `:GetPlayerDataReplica(player)` when you genuinely need the underlying `Replica` — required for **table/array mutations** so they replicate properly. Mutating nested tables via `SetValue` is wrong; reach for the replica.
+  - `:CreateProfileHold(player)` / `:ReleaseProfileHold(holdId)` to keep a profile alive across an async operation (purchase grant, external API call) so it can't unload mid-flight.
+  - `keyPath` accepts `"Tokens"`, `"Powerups.ExtraLives"`, or `{ "Powerups", "ExtraLives" }` interchangeably — pick the form that reads best.
+- **Client: `shared("DataController")`** — read-only mirror. Use:
+  - `:GetValue(keyPath)` for one-shot reads.
+  - `:Observe(path, callback)` to drive UI off changes (fires immediately with the current value, then on every update).
+  - `:GetData()` / `:GetDataReplica()` when you need the whole tree or the raw replica. The table from `:GetData()` is **read-only** — never write to it from the client.
+- **Schema lives in shared.** Define the profile template / type in `shared/core/lib/` (e.g. `PlayerDataSchema.luau` for the template + `Types.luau` for the Luau type) so both `PlayerData` and `DataController` consumers refer to the same source of truth.
+- **Don't paper over it.** Do not wrap `PlayerData` in another "DataService" facade just to feel familiar — call it directly from the task that needs it. Adding a wrapper duplicates the API and hides the replica handle from anything that needs to mutate tables.
+
 ### Cyclic dependencies
 
 - Cyclic dependencies are **supported**. That's Order's headline feature.
@@ -186,7 +204,7 @@ When asked "what should I use for X" the default answers are:
 
 - **Build / sync**: Rojo for source-of-truth, Lune for CI scripts and codegen, Rokit (preferred) or Aftman for pinning all tool versions in `rokit.toml`.
 - **Packages**: Wally with a clean split between `[dependencies]` and `[dev-dependencies]`. Pin exact versions. Run `wally install` from CI.
-- **Persistence**: **ProfileStore** (the modern successor; preferred over the legacy ProfileService) — gives session-locking, schema reconciliation, auto-save cadence. Never roll your own DataStore wrapper for player data.
+- **Persistence**: Use Order's built-in **`PlayerData`** (server) and **`DataController`** (client) tasks — they wrap ProfileService + ReplicaService and give you session-locking, replication, observers, and profile holds out of the box. Never require ProfileService / ProfileStore / ReplicaService directly, and never roll your own DataStore wrapper for player data. See [Built-in player data](#built-in-player-data-playerdata--datacontroller) for the API surface.
 - **Networking**: **ByteNet** or **Red** for typed remotes with buffer packing and ergonomic schemas. If hand-rolling, build a single `GetRemote(name)` factory in `shared/lib/` plus strict per-arg validation, and reference the `roblox-opsec` skill.
 - **State / ECS**: **Matter** for ECS-heavy gameplay. **Charm**, **Vide**, or **Fusion 0.3** for reactive state in UI. **Roact 17** only for legacy maintenance.
 - **UI**: **Fusion** or **Vide** for new work. **Iris** for in-game dev tools and debug panels. **TopbarPlus** for top-bar icons.
@@ -208,6 +226,7 @@ Each item below is a tool or pattern that duplicates a responsibility Order alre
 - **Custom multi-place routing** — separate `default.project.json` files glued together with shell scripts, runtime `if game.PlaceId == X then ...` switches, env-var place dispatch. Use `Settings.PlaceTypes` + `CodeGroups` and read `shared.PlaceType` at runtime.
 - **Re-implementing cyclic-dep workarounds** (forward-declaration tables, lazy-getter wrappers around `require`). Order supports cycles natively — wrap the access in a function and move on.
 - **Custom verbose-loading / boot-timing instrumentation.** Use `Settings.Debug.VerboseLoading` and `Settings.Debug.CyclicAnalysis`.
+- **Direct ProfileService / ProfileStore / ReplicaService usage, or hand-rolled DataStore wrappers for player data.** Order's `PlayerData` (server) and `DataController` (client) already wrap ProfileService + ReplicaService — schema, session-locking, replication, observers, and profile holds. Go through them. Don't even add a thin facade module on top; call `shared("PlayerData")` / `shared("DataController")` from the task that needs it.
 
 If you find yourself wanting any of the above, the answer is to use Order more idiomatically, not to bring in a second framework.
 
@@ -237,7 +256,9 @@ When reviewing an existing repo, look for and call out:
 - Cross-context leaks (`shared/` reaching into `server/`, `client/` requiring `server/`) -> invert the dependency or move the type.
 - **Knit / Flamework / Sapphire (or any other orchestration framework) present** -> migrate services to Order tasks with `:Prep()`/`:Init()`; cite the rejection section above.
 - **Custom `Loader`-style folder-walk utilities** -> delete; rely on `tasks/` auto-discovery.
-- Hand-rolled DataStore wrappers for player data -> recommend ProfileStore migration with a one-shot Lune script for the schema move.
+- **Direct `require`s of ProfileService, ProfileStore, ReplicaService, or hand-rolled DataStore wrappers for player data** -> migrate to Order's `PlayerData` (server) / `DataController` (client). Move the profile template into `shared/<group>/lib/PlayerDataSchema.luau`, replace reads with `:GetValue`/`:Observe`, replace writes with `:SetValue`/`:IncrementNumValue`, and route nested-table mutations through `:GetPlayerDataReplica(player)` so they replicate.
+- **A bespoke `DataService` / `PlayerDataManager` facade wrapping `PlayerData`** -> delete the wrapper; have callers `shared("PlayerData")` directly. The facade duplicates the API and hides the replica.
+- **Client code reading data via remotes instead of `DataController`** -> migrate to `DataController:Observe(...)` / `:GetValue(...)`. Order is already replicating the profile; a parallel remote channel is a second source of truth.
 - Hand-rolled remotes without validation -> recommend ByteNet/Red and reference the `roblox-opsec` skill for the validation layer.
 - Mixed tool versions or no `rokit.toml` -> consolidate.
 - No CI running selene + stylua + tests -> add it.
